@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -19,18 +20,36 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// RelayerConfig holds the configuration for the relayer
+type RelayerConfig struct {
+	ClientA       *ethclient.Client
+	ClientB       *ethclient.Client
+	PrivateKey    *ecdsa.PrivateKey
+	ContractAAddr common.Address
+	ContractBAddr common.Address
+	RelayerAddr   common.Address
+	ContractAABI  abi.ABI
+	ContractBABI  abi.ABI
+	ChainIDA      *big.Int
+	ChainIDB      *big.Int
+}
+
+// EventProcessor handles event processing and transaction sending
+type EventProcessor struct {
+	config *RelayerConfig
+	mu     sync.Mutex
+}
+
+// NewEventProcessor creates a new event processor
+func NewEventProcessor(config *RelayerConfig) *EventProcessor {
+	return &EventProcessor{
+		config: config,
+	}
+}
+
 // Global variables for the relayer
 var (
-	clientA       *ethclient.Client      // Client connection to Network A
-	clientB       *ethclient.Client      // Client connection to Network B
-	privateKey    *ecdsa.PrivateKey      // Relayer's private key for signing transactions
-	contractAAddr common.Address         // Address of the contract on Network A
-	contractBAddr common.Address         // Address of the contract on Network B
-	relayerAddr   common.Address         // Address of the relayer account
-	contractAABI  abi.ABI                // ABI of Contract A
-	contractBABI  abi.ABI                // ABI of Contract B
-	chainIDA      = big.NewInt(84532)    // Chain ID for Network A (Base Goerli)
-	chainIDB      = big.NewInt(11155111) // Chain ID for Network B (Sepolia)
+	config *RelayerConfig
 )
 
 // main function initializes the relayer and starts listening for events
@@ -41,58 +60,91 @@ func main() {
 		fmt.Println("Error loading .env file: ", err)
 	}
 
-	// Establish connection to Network A
-	clientA, err = ethclient.Dial(os.Getenv("NETWORK_A_RPC"))
+	// Initialize configuration
+	config, err = initializeConfig()
 	if err != nil {
-		log.Fatalf("Failed to connect to network A: %v", err)
+		log.Fatalf("Failed to initialize config: %v", err)
 	}
 
-	// Establish connection to Network B
-	clientB, err = ethclient.Dial(os.Getenv("NETWORK_B_RPC"))
-	if err != nil {
-		log.Fatalf("Failed to connect to network B: %v", err)
-	}
+	// Create event processor
+	processor := NewEventProcessor(config)
 
-	blockNumber, err := clientA.BlockNumber(context.Background())
-	if err != nil {
-		log.Fatalf("Failed to get block number for chain A: %v", err)
-	}
-	fmt.Println("chainA Block Number", blockNumber)
+	// Start event listeners in separate goroutines with error handling
+	var wg sync.WaitGroup
+	wg.Add(3)
 
-	blockNumber, err = clientB.BlockNumber(context.Background())
-	if err != nil {
-		log.Fatalf("Failed to get block number for chain A: %v", err)
-	}
-	fmt.Println("chainB Block Number", blockNumber)
+	go func() {
+		defer wg.Done()
+		if err := processor.listenSynEvent(); err != nil {
+			log.Printf("Error in SynEvent listener: %v", err)
+		}
+	}()
 
-	// Parse contract addresses from environment variables
-	contractAAddr = common.HexToAddress(os.Getenv("CONTRACT_A"))
-	contractBAddr = common.HexToAddress(os.Getenv("CONTRACT_B"))
+	go func() {
+		defer wg.Done()
+		if err := processor.listenAckEvent(); err != nil {
+			log.Printf("Error in AckEvent listener: %v", err)
+		}
+	}()
 
-	// Load and decrypt the relayer's private key
-	privateKey, err = loadPrivateKey(os.Getenv("RELAYER_PRIVATE_KEY"))
-	if err != nil {
-		log.Fatalf("Failed to load private key: %v", err)
-	}
-
-	// Parse the contract ABIs from environment variables
-	contractAABI, err = abi.JSON(strings.NewReader(os.Getenv("CONTRACT_A_ABI")))
-	if err != nil {
-		log.Fatalf("Failed to parse Contract A ABI: %v", err)
-	}
-
-	contractBABI, err = abi.JSON(strings.NewReader(os.Getenv("CONTRACT_B_ABI")))
-	if err != nil {
-		log.Fatalf("Failed to parse Contract B ABI: %v", err)
-	}
-
-	// Start event listeners in separate goroutines
-	go listenSynEvent()    // Listen for SynSent events on Network A
-	go listenAckEvent()    // Listen for AckSent events on Network B
-	go listenSynAckEvent() // Listen for SynAckSent events on Network A
+	go func() {
+		defer wg.Done()
+		if err := processor.listenSynAckEvent(); err != nil {
+			log.Printf("Error in SynAckEvent listener: %v", err)
+		}
+	}()
 
 	// Keep the relayer running indefinitely
 	select {}
+}
+
+// initializeConfig initializes the relayer configuration
+func initializeConfig() (*RelayerConfig, error) {
+	// Establish connection to Network A
+	clientA, err := ethclient.Dial(os.Getenv("NETWORK_A_RPC"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to network A: %v", err)
+	}
+
+	// Establish connection to Network B
+	clientB, err := ethclient.Dial(os.Getenv("NETWORK_B_RPC"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to network B: %v", err)
+	}
+
+	// Parse contract addresses
+	contractAAddr := common.HexToAddress(os.Getenv("CONTRACT_A"))
+	contractBAddr := common.HexToAddress(os.Getenv("CONTRACT_B"))
+
+	// Load private key
+	privateKey, err := loadPrivateKey(os.Getenv("RELAYER_PRIVATE_KEY"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load private key: %v", err)
+	}
+
+	// Parse contract ABIs
+	contractAABI, err := abi.JSON(strings.NewReader(os.Getenv("CONTRACT_A_ABI")))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse Contract A ABI: %v", err)
+	}
+
+	contractBABI, err := abi.JSON(strings.NewReader(os.Getenv("CONTRACT_B_ABI")))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse Contract B ABI: %v", err)
+	}
+
+	return &RelayerConfig{
+		ClientA:       clientA,
+		ClientB:       clientB,
+		PrivateKey:    privateKey,
+		ContractAAddr: contractAAddr,
+		ContractBAddr: contractBAddr,
+		RelayerAddr:   crypto.PubkeyToAddress(privateKey.PublicKey),
+		ContractAABI:  contractAABI,
+		ContractBABI:  contractBABI,
+		ChainIDA:      big.NewInt(84532),
+		ChainIDB:      big.NewInt(11155111),
+	}, nil
 }
 
 // loadPrivateKey converts a hex private key string to an ECDSA private key
@@ -112,25 +164,22 @@ func loadPrivateKey(hexKey string) (*ecdsa.PrivateKey, error) {
 		return nil, fmt.Errorf("failed to convert private key: %v", err)
 	}
 
-	// Set the relayer address
-	relayerAddr = crypto.PubkeyToAddress(privateKey.PublicKey)
-
 	return privateKey, nil
 }
 
 // listenSynEvent listens for SynSent events on Contract A and relays them to Contract B
-func listenSynEvent() {
+func (p *EventProcessor) listenSynEvent() error {
 	// Get the latest block number
-	latestBlock, err := clientA.BlockNumber(context.Background())
+	latestBlock, err := p.config.ClientA.BlockNumber(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to get latest block: %v", err)
+		return fmt.Errorf("failed to get latest block: %v", err)
 	}
 	fmt.Printf("Starting to listen for SynSent events from block %d\n", latestBlock)
 
 	delay := time.Second * 1 // Fixed 1 second delay
 
 	// Create event signature for SynSent
-	synSentEvent := contractAABI.Events["SynSent"]
+	synSentEvent := p.config.ContractAABI.Events["SynSent"]
 	synSentTopic := synSentEvent.ID
 
 	// Keep track of processed event hashes
@@ -138,7 +187,7 @@ func listenSynEvent() {
 
 	for {
 		// Get current block number
-		currentBlock, err := clientA.BlockNumber(context.Background())
+		currentBlock, err := p.config.ClientA.BlockNumber(context.Background())
 		if err != nil {
 			log.Printf("Error getting current block: %v", err)
 			time.Sleep(delay)
@@ -148,10 +197,10 @@ func listenSynEvent() {
 		// If we're behind, process all blocks up to current
 		if currentBlock > latestBlock {
 			// Get logs from all blocks up to current
-			logs, err := clientA.FilterLogs(context.Background(), ethereum.FilterQuery{
+			logs, err := p.config.ClientA.FilterLogs(context.Background(), ethereum.FilterQuery{
 				FromBlock: big.NewInt(int64(latestBlock)),
 				ToBlock:   big.NewInt(int64(currentBlock)),
-				Addresses: []common.Address{contractAAddr},
+				Addresses: []common.Address{p.config.ContractAAddr},
 				Topics:    [][]common.Hash{{synSentTopic}},
 			})
 			if err != nil {
@@ -171,7 +220,10 @@ func listenSynEvent() {
 				}
 
 				fmt.Println("SynSent event detected. Relaying to Contract B...")
-				sendTransaction(clientB, contractBAddr, "receiveSyn")
+				if err := p.sendTransaction(p.config.ClientB, p.config.ContractBAddr, "receiveSyn"); err != nil {
+					fmt.Printf("Failed to send transaction: %v\n", err)
+					continue
+				}
 
 				// Mark this event as processed
 				processedEvents[eventID] = true
@@ -186,18 +238,18 @@ func listenSynEvent() {
 }
 
 // listenAckEvent listens for AckSent events on Contract B and relays them to Contract A
-func listenAckEvent() {
+func (p *EventProcessor) listenAckEvent() error {
 	// Get the latest block number
-	latestBlock, err := clientB.BlockNumber(context.Background())
+	latestBlock, err := p.config.ClientB.BlockNumber(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to get latest block: %v", err)
+		return fmt.Errorf("failed to get latest block: %v", err)
 	}
 	fmt.Printf("Starting to listen for AckSent events from block %d\n", latestBlock)
 
 	delay := time.Second * 1 // Fixed 1 second delay
 
 	// Create event signature for AckSent
-	ackSentEvent := contractBABI.Events["AckSent"]
+	ackSentEvent := p.config.ContractBABI.Events["AckSent"]
 	ackSentTopic := ackSentEvent.ID
 
 	// Keep track of processed event hashes
@@ -205,7 +257,7 @@ func listenAckEvent() {
 
 	for {
 		// Get current block number
-		currentBlock, err := clientB.BlockNumber(context.Background())
+		currentBlock, err := p.config.ClientB.BlockNumber(context.Background())
 		if err != nil {
 			log.Printf("Error getting current block: %v", err)
 			time.Sleep(delay)
@@ -215,10 +267,10 @@ func listenAckEvent() {
 		// If we're behind, process all blocks up to current
 		if currentBlock > latestBlock {
 			// Get logs from all blocks up to current
-			logs, err := clientB.FilterLogs(context.Background(), ethereum.FilterQuery{
+			logs, err := p.config.ClientB.FilterLogs(context.Background(), ethereum.FilterQuery{
 				FromBlock: big.NewInt(int64(latestBlock)),
 				ToBlock:   big.NewInt(int64(currentBlock)),
-				Addresses: []common.Address{contractBAddr},
+				Addresses: []common.Address{p.config.ContractBAddr},
 				Topics:    [][]common.Hash{{ackSentTopic}},
 			})
 			if err != nil {
@@ -238,7 +290,10 @@ func listenAckEvent() {
 				}
 
 				fmt.Println("AckSent event detected. Relaying to Contract A...")
-				sendTransaction(clientA, contractAAddr, "receiveAck")
+				if err := p.sendTransaction(p.config.ClientA, p.config.ContractAAddr, "receiveAck"); err != nil {
+					fmt.Printf("Failed to send transaction: %v\n", err)
+					continue
+				}
 
 				// Mark this event as processed
 				processedEvents[eventID] = true
@@ -253,18 +308,18 @@ func listenAckEvent() {
 }
 
 // listenSynAckEvent listens for SynAckSent events on Contract A and relays them to Contract B
-func listenSynAckEvent() {
+func (p *EventProcessor) listenSynAckEvent() error {
 	// Get the latest block number
-	latestBlock, err := clientA.BlockNumber(context.Background())
+	latestBlock, err := p.config.ClientA.BlockNumber(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to get latest block: %v", err)
+		return fmt.Errorf("failed to get latest block: %v", err)
 	}
 	fmt.Printf("Starting to listen for SynAckSent events from block %d\n", latestBlock)
 
 	delay := time.Second * 1 // Fixed 1 second delay
 
 	// Create event signature for SynAckSent
-	synAckSentEvent := contractAABI.Events["SynAckSent"]
+	synAckSentEvent := p.config.ContractAABI.Events["SynAckSent"]
 	synAckSentTopic := synAckSentEvent.ID
 
 	// Keep track of processed event hashes
@@ -272,7 +327,7 @@ func listenSynAckEvent() {
 
 	for {
 		// Get current block number
-		currentBlock, err := clientA.BlockNumber(context.Background())
+		currentBlock, err := p.config.ClientA.BlockNumber(context.Background())
 		if err != nil {
 			log.Printf("Error getting current block: %v", err)
 			time.Sleep(delay)
@@ -282,10 +337,10 @@ func listenSynAckEvent() {
 		// If we're behind, process all blocks up to current
 		if currentBlock > latestBlock {
 			// Get logs from all blocks up to current
-			logs, err := clientA.FilterLogs(context.Background(), ethereum.FilterQuery{
+			logs, err := p.config.ClientA.FilterLogs(context.Background(), ethereum.FilterQuery{
 				FromBlock: big.NewInt(int64(latestBlock)),
 				ToBlock:   big.NewInt(int64(currentBlock)),
-				Addresses: []common.Address{contractAAddr},
+				Addresses: []common.Address{p.config.ContractAAddr},
 				Topics:    [][]common.Hash{{synAckSentTopic}},
 			})
 			if err != nil {
@@ -305,7 +360,10 @@ func listenSynAckEvent() {
 				}
 
 				fmt.Println("SynAckSent event detected. Relaying to Contract B...")
-				sendTransaction(clientB, contractBAddr, "receiveSynAck")
+				if err := p.sendTransaction(p.config.ClientB, p.config.ContractBAddr, "receiveSynAck"); err != nil {
+					fmt.Printf("Failed to send transaction: %v", err)
+					continue
+				}
 
 				// Mark this event as processed
 				processedEvents[eventID] = true
@@ -320,38 +378,38 @@ func listenSynAckEvent() {
 }
 
 // sendTransaction creates and sends a transaction to the specified contract
-func sendTransaction(client *ethclient.Client, contract common.Address, method string) {
+func (p *EventProcessor) sendTransaction(client *ethclient.Client, contract common.Address, method string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	// Check if relayer address is set
-	if relayerAddr == (common.Address{}) {
-		log.Fatal("Relayer address not initialized")
+	if p.config.RelayerAddr == (common.Address{}) {
+		return fmt.Errorf("relayer address not initialized")
 	}
 
 	// Get the current nonce for the relayer account
-	nonce, err := client.NonceAt(context.Background(), relayerAddr, nil)
+	nonce, err := client.NonceAt(context.Background(), p.config.RelayerAddr, nil)
 	if err != nil {
-		log.Printf("Failed to get nonce: %v", err)
-		return
+		return fmt.Errorf("failed to get nonce: %v", err)
 	}
 
 	// Select the appropriate ABI and chain ID based on the contract address
 	var contractABI abi.ABI
 	var chainID *big.Int
-	if contract == contractAAddr {
-		contractABI = contractAABI
-		chainID = chainIDA
-	} else if contract == contractBAddr {
-		contractABI = contractBABI
-		chainID = chainIDB
+	if contract == p.config.ContractAAddr {
+		contractABI = p.config.ContractAABI
+		chainID = p.config.ChainIDA
+	} else if contract == p.config.ContractBAddr {
+		contractABI = p.config.ContractBABI
+		chainID = p.config.ChainIDB
 	} else {
-		log.Printf("Unknown contract address: %s", contract.Hex())
-		return
+		return fmt.Errorf("unknown contract address: %s", contract.Hex())
 	}
 
 	// Pack the function call data
 	data, err := contractABI.Pack(method)
 	if err != nil {
-		log.Printf("Failed to pack function call: %v", err)
-		return
+		return fmt.Errorf("failed to pack function call: %v", err)
 	}
 
 	// Use fixed gas values
@@ -372,10 +430,9 @@ func sendTransaction(client *ethclient.Client, contract common.Address, method s
 		)
 
 		// Sign the transaction
-		signedTx, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), privateKey)
+		signedTx, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), p.config.PrivateKey)
 		if err != nil {
-			log.Printf("Failed to sign transaction: %v", err)
-			return
+			return fmt.Errorf("failed to sign transaction: %v", err)
 		}
 
 		// Send the transaction to the network
@@ -383,22 +440,20 @@ func sendTransaction(client *ethclient.Client, contract common.Address, method s
 		if err != nil {
 			if strings.Contains(err.Error(), "nonce too low") {
 				// Get the latest nonce again and retry
-				nonce, err = client.NonceAt(context.Background(), relayerAddr, nil)
+				nonce, err = client.NonceAt(context.Background(), p.config.RelayerAddr, nil)
 				if err != nil {
-					log.Printf("Failed to get nonce on retry: %v", err)
-					return
+					return fmt.Errorf("failed to get nonce on retry: %v", err)
 				}
 				log.Printf("Retrying with new nonce: %d", nonce)
 				continue
 			}
-			log.Printf("Failed to send transaction: %v", err)
-			return
+			return fmt.Errorf("failed to send transaction: %v", err)
 		}
 
 		// Print transaction details
 		fmt.Printf("\nTransaction submitted:\n")
 		fmt.Printf("Hash: %s\n", signedTx.Hash().Hex())
-		fmt.Printf("From: %s\n", relayerAddr.Hex())
+		fmt.Printf("From: %s\n", p.config.RelayerAddr.Hex())
 		fmt.Printf("To: %s\n", contract.Hex())
 		fmt.Printf("Nonce: %d\n", nonce)
 		fmt.Printf("Gas Price: %s wei\n", gasPrice.String())
@@ -407,8 +462,8 @@ func sendTransaction(client *ethclient.Client, contract common.Address, method s
 		fmt.Printf("Data: %x\n", data)
 		fmt.Printf("Chain ID: %s\n", chainID.String())
 		fmt.Println("----------------------------------------\n")
-		return
+		return nil
 	}
 
-	log.Printf("Failed to send transaction after %d retries", maxRetries)
+	return fmt.Errorf("failed to send transaction after %d retries", maxRetries)
 }

@@ -99,3 +99,7 @@ The relayer provides detailed logging:
 - Event detection
 - Error messages
 - Network status updates
+
+
+
+![image](https://github.com/user-attachments/assets/e018a0a3-8c59-4574-9a16-776209fe15a0)
